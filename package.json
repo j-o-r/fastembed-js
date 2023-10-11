@@ -37,9 +37,10 @@
     "vitest": "^0.34.4"
   },
   "dependencies": {
-    "@anush008/tokenizers": "^0.0.0",
-    "onnxruntime-node": "1.15.1",
+    "@xenova/transformers": "^2.6.2",
+    "onnxruntime-node": "^1.16.0",
     "progress": "^2.0.3",
+    "sharp": "^0.32.6",
     "tar": "^6.2.0"
   }
 }

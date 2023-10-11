@@ -3,8 +3,9 @@ import https from "https";
 import path from "path";
 import Progress from "progress";
 import tar from "tar";
-import { AddedToken, Tokenizer } from "@anush008/tokenizers";
 import * as ort from "onnxruntime-node";
+import { AutoTokenizer, PreTrainedTokenizer, env } from "@xenova/transformers";
+env.localModelPath = "/Users/anush/Desktop/fastembed-js/";
 
 export enum ExecutionProvider {
   CPU = "cpu",
@@ -102,7 +103,7 @@ abstract class Embedding {
 
 export class FlagEmbedding extends Embedding {
   private constructor(
-    private tokenizer: Tokenizer,
+    private tokenizer: PreTrainedTokenizer,
     private session: ort.InferenceSession,
     private model: EmbeddingModel
   ) {
@@ -122,7 +123,9 @@ export class FlagEmbedding extends Embedding {
       showDownloadProgress
     );
 
-    const tokenizer = this.loadTokenizer(modelDir, maxLength);
+    console.log(32323);
+    const tokenizer = await this.loadTokenizer(modelDir, maxLength);
+    console.log(53534);
 
     const modelPath = path.join(modelDir.toString(), "model_optimized.onnx");
     if (!fs.existsSync(modelPath)) {
@@ -135,10 +138,10 @@ export class FlagEmbedding extends Embedding {
     return new FlagEmbedding(tokenizer, session, model);
   }
 
-  private static loadTokenizer(
+  private static async loadTokenizer(
     modelDir: fs.PathLike,
     maxLength: number
-  ): Tokenizer {
+  ): Promise<PreTrainedTokenizer> {
     const tokenizerPath = path.join(modelDir.toString(), "tokenizer.json");
     if (!fs.existsSync(tokenizerPath)) {
       throw new Error(`Tokenizer file not found at ${tokenizerPath}`);
@@ -150,18 +153,6 @@ export class FlagEmbedding extends Embedding {
     }
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
-    const tokenizerFilePath = path.join(
-      modelDir.toString(),
-      "tokenizer_config.json"
-    );
-    if (!fs.existsSync(tokenizerFilePath)) {
-      throw new Error(`Tokenizer file not found at ${tokenizerFilePath}`);
-    }
-    const tokenizerConfig = JSON.parse(
-      fs.readFileSync(tokenizerFilePath, "utf-8")
-    );
-    maxLength = Math.min(maxLength, tokenizerConfig["model_max_length"]);
-
     const tokensMapPath = path.join(
       modelDir.toString(),
       "special_tokens_map.json"
@@ -171,28 +162,24 @@ export class FlagEmbedding extends Embedding {
     }
     const tokensMap = JSON.parse(fs.readFileSync(tokensMapPath, "utf-8"));
 
-    const tokenizer = Tokenizer.fromFile(tokenizerPath);
-
-    tokenizer.setTruncation(maxLength);
-    tokenizer.setPadding({
+    const tokenizer = await AutoTokenizer.from_pretrained(tokenizerPath);
+    tokenizer.model_max_length = Math.min(
       maxLength,
-      padId: config["pad_token_id"],
-      padToken: tokenizerConfig["pad_token"],
-    });
+      tokenizer.model_max_length
+    );
+    tokenizer.pad_token_id = config["pad_token_id"];
 
+    let specialTokens = [];
     for (let token of Object.values(tokensMap)) {
       if (typeof token === "string") {
-        tokenizer.addSpecialTokens([token]);
+        specialTokens.push(token);
       } else if (isAddedTokenMap(token)) {
-        const addedToken = new AddedToken(token["content"], true, {
-          singleWord: token["single_word"],
-          leftStrip: token["lstrip"],
-          rightStrip: token["rstrip"],
-          normalized: token["normalized"],
-        });
-        tokenizer.addAddedTokens([addedToken]);
+        specialTokens.push(token);
       }
     }
+
+    tokenizer.special_tokens = specialTokens;
+
     return tokenizer;
   }
 
@@ -310,40 +297,37 @@ export class FlagEmbedding extends Embedding {
       const batchTexts = textStrings.slice(i, i + batchSize);
 
       const encodedTexts = await Promise.all(
-        batchTexts.map((textString) => this.tokenizer.encode(textString))
+        batchTexts.map(async (textString) => await this.tokenizer(textString))
       );
 
-      const idsArray: bigint[][] = [];
-      const maskArray: bigint[][] = [];
-      const typeIdsArray: bigint[][] = [];
+      let maxLength = 0;
+      const idsArray: number[] = [];
+      const maskArray: number[] = [];
+      const typeIdsArray: number[] = [];
 
       encodedTexts.forEach((text) => {
-        const ids = text.getIds().map(BigInt);
-        const mask = text.getAttentionMask().map(BigInt);
-        const typeIds = text.getTypeIds().map(BigInt);
+        const ids = text.input_ids;
+        const mask = text.attention_mask;
+        const typeIds = text.token_type_ids;
+        maxLength = ids.length;
 
-        idsArray.push(ids);
-        maskArray.push(mask);
-        typeIdsArray.push(typeIds);
+        idsArray.push(...ids);
+        maskArray.push(...mask);
+        typeIdsArray.push(...typeIds);
       });
 
-      const maxLength = idsArray[0].length;
-
-      const batchInputIds = new ort.Tensor(
-        "int64",
-        idsArray.flat() as unknown as number[],
-        [batchTexts.length, maxLength]
-      );
-      const batchAttentionMask = new ort.Tensor(
-        "int64",
-        maskArray.flat() as unknown as number[],
-        [batchTexts.length, maxLength]
-      );
-      const batchTokenTypeId = new ort.Tensor(
-        "int64",
-        typeIdsArray.flat() as unknown as number[],
-        [batchTexts.length, maxLength]
-      );
+      const batchInputIds = new ort.Tensor("int64", idsArray, [
+        batchTexts.length,
+        maxLength,
+      ]);
+      const batchAttentionMask = new ort.Tensor("int64", maskArray, [
+        batchTexts.length,
+        maxLength,
+      ]);
+      const batchTokenTypeId = new ort.Tensor("int64", typeIdsArray, [
+        batchTexts.length,
+        maxLength,
+      ]);
 
       const inputs: ModelInput = {
         input_ids: batchInputIds,
@@ -352,7 +336,7 @@ export class FlagEmbedding extends Embedding {
       };
 
       // Exclude token_type_ids for MLE5Large
-      if(this.model === EmbeddingModel.MLE5Large) {
+      if (this.model === EmbeddingModel.MLE5Large) {
         delete inputs.token_type_ids;
       }
 
